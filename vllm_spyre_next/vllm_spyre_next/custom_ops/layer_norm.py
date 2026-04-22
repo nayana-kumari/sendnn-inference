@@ -6,7 +6,7 @@ from functools import lru_cache
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from .utils import convert, register_layer, get_layer, _fake_impl
+from .utils import register_layer, get_layer, _fake_impl
 
 logger = init_logger(__name__)
 
@@ -15,14 +15,21 @@ _SPYRE_MIN_BATCH_SIZE = 64
 
 class SpyreLayerNorm:
     """
-    Spyre implementation of LayerNorm.
-
-    Standard LayerNorm using mean + variance normalization.
+    Spyre LayerNorm implementation (Spyre backend only).
+    CPU fallback removed as requested.
     """
 
-    def __init__(self):
-        self._target_device = torch.device("spyre")
-        self._target_dtype = torch.float16
+    def __init__(
+        self,
+        dim: int = 0,
+        eps: float = 1e-5,
+        weight: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
+    ):
+        self.dim = dim
+        self.eps = eps
+        self.weight = weight
+        self.bias = bias
 
         self._layer_name = register_layer(self, "spyre_layernorm")
 
@@ -31,11 +38,11 @@ class SpyreLayerNorm:
         x: torch.Tensor,
         eps: float,
         hidden_size: int,
-        weight: torch.Tensor,
-        bias: torch.Tensor,
+        weight: torch.Tensor | None,
+        bias: torch.Tensor | None,
     ):
         """
-        Core LayerNorm math.
+        Pure LayerNorm implementation (Spyre / fallback math path).
         """
         mean = x.mean(dim=-1, keepdim=True)
         variance = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
@@ -44,7 +51,6 @@ class SpyreLayerNorm:
 
         if weight is not None:
             x_norm = x_norm * weight
-
         if bias is not None:
             x_norm = x_norm + bias
 
@@ -55,40 +61,57 @@ class SpyreLayerNorm:
         x: torch.Tensor,
         eps: float,
         hidden_size: int,
-        weight: torch.Tensor,
-        bias: torch.Tensor,
+        weight: torch.Tensor | None,
+        bias: torch.Tensor | None,
     ):
+        """
+        Spyre execution path only.
+        Includes batching safety padding for Spyre kernel.
+        """
+
+        orig_batch_size = x.shape[0]
         x_dtype = x.dtype
         x_device = x.device
 
-        orig_batch_size = x.shape[0]
-
-        # Pad small batch (Spyre requirement)
+        # batch padding for Spyre constraint
         if x.shape[0] < _SPYRE_MIN_BATCH_SIZE:
             pad = _SPYRE_MIN_BATCH_SIZE - x.shape[0]
-            x = torch.nn.functional.pad(x, (0, 0, 0, pad))
 
+            pad_tensor = torch.zeros(
+                pad,
+                x.shape[1],
+                x.shape[2],
+                dtype=x.dtype,
+                device=x.device,
+            )
+
+            x = torch.cat([x, pad_tensor], dim=0)
+
+        # forward compute (Spyre assumed available in runtime)
         out = self.forward_spyre(
-            convert(x, self._target_device, self._target_dtype),
+            x,
             eps,
             hidden_size,
-            convert(weight, self._target_device, self._target_dtype),
-            convert(bias, self._target_device, self._target_dtype)
-            if bias is not None
-            else None,
+            weight,
+            bias,
         )
 
-        return convert(out, dtype=x_dtype, device=x_device)[:orig_batch_size]
+        # restore original shape
+        out = out[:orig_batch_size]
+
+        return out
 
 
 def _op_func(
     x: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
-) -> None:
+) -> torch.Tensor:
     """
-    Spyre backend entry point.
+    Torch custom op entry point for vLLM OOT integration.
+    MUST return tensor (required by torch schema inference).
     """
+
     layer = get_layer(layer_name)
 
     result = layer._forward_spyre_impl(
@@ -101,12 +124,17 @@ def _op_func(
 
     output.copy_(result)
 
+    return output
+
 
 @lru_cache(maxsize=1)
 def register():
     """
     Register Spyre LayerNorm custom op.
     """
+
+    SpyreLayerNorm()
+
     direct_register_custom_op(
         op_name="spyre_layernorm",
         op_func=_op_func,
